@@ -12,6 +12,12 @@
  * - invalidateTag(tag)
  * - invalidateTags(tags[])
  *
+ * - Single-flight / cache stampede protection (Issue #195):
+ *   getOrLoad(key, loader, ttl, tags?) coalesces concurrent misses so the
+ *   loader function is invoked at most once per in-flight window.  Failed
+ *   loads are never cached, and the in-flight entry is removed so the next
+ *   caller retries cleanly.
+ *
  * Redis is optional: if REDIS_URL is unset or the connection fails the
  * service transparently falls back to the in-memory store.
  */
@@ -241,6 +247,75 @@ async function invalidateTags(tags) {
   await Promise.all(tags.map(invalidateTag));
 }
 
+// ── Single-flight / cache stampede protection (Issue #195) ───────────────────
+//
+// `_inFlight` maps a *scoped* cache key to the Promise that is currently
+// loading it.  When `getOrLoad` detects a miss it checks this map first:
+//
+//  - If a Promise is already in-flight for this key, the caller awaits it
+//    directly — no second DB/loader invocation is made.
+//  - If no Promise is in-flight a new one is created, stored, and awaited.
+//
+// On success the result is written to cache and the in-flight entry removed.
+// On failure the in-flight entry is removed without caching, so the next
+// caller transparently retries.
+
+/** @type {Map<string, Promise<*>>} */
+const _inFlight = new Map();
+
+/**
+ * Read-through cache with single-flight coalescing.
+ *
+ * Concurrent cache misses for the same `key` call `loader` only once.
+ * Errors thrown by `loader` propagate to all waiting callers and do NOT
+ * poison the cache — the next call will attempt the loader again.
+ *
+ * @param {string}      key        — logical cache key (will be scoped)
+ * @param {() => Promise<*>} loader — async function that fetches fresh data
+ * @param {number}      [ttlSeconds=60] — TTL passed to set/setWithTags
+ * @param {string[]}    [tags=[]]  — optional invalidation tags
+ * @returns {Promise<*>}
+ */
+async function getOrLoad(key, loader, ttlSeconds = 60, tags = []) {
+  // Fast path: cache hit
+  const cached = await get(key);
+  if (cached !== null) return cached;
+
+  const scopedKey = scopeCacheKey(key);
+
+  // Single-flight: if there is already an in-flight load for this key,
+  // wait for it instead of firing a second loader.
+  if (_inFlight.has(scopedKey)) {
+    log.debug({ message: 'cache_stampede_coalesced', key: scopedKey });
+    return _inFlight.get(scopedKey);
+  }
+
+  // No hit, no in-flight — start a new load.
+  const loadPromise = (async () => {
+    try {
+      const value = await loader();
+      // Persist to cache (with optional tags) before removing in-flight entry
+      if (tags.length > 0) {
+        await setWithTags(key, value, ttlSeconds, tags);
+      } else {
+        await set(key, value, ttlSeconds);
+      }
+      log.debug({ message: 'cache_loaded_and_stored', key: scopedKey });
+      return value;
+    } catch (err) {
+      // Loader failed — do NOT cache the error so the next caller retries.
+      log.warn({ message: 'cache_loader_failed', key: scopedKey, error: err.message });
+      throw err;
+    } finally {
+      // Always clean up the in-flight entry, success or failure.
+      _inFlight.delete(scopedKey);
+    }
+  })();
+
+  _inFlight.set(scopedKey, loadPromise);
+  return loadPromise;
+}
+
 /** Warm the cache by calling a loader function if the key is cold. */
 async function warm(key, loader, ttlSeconds = 60) {
   const existing = await get(key);
@@ -258,6 +333,7 @@ function analytics() {
     hitRate: total > 0 ? (stats.hits / total).toFixed(4) : '0',
     backend: redisReady ? 'redis' : 'memory',
     memSize: mem.size(),
+    inFlightCount: _inFlight.size,
   };
 }
 
@@ -275,6 +351,8 @@ export default {
   invalidateTag,
   invalidateTags,
   warm,
+  getOrLoad,
   analytics,
   size,
 };
+
